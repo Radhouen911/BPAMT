@@ -1,0 +1,35 @@
+name: "Cryptography Example"
+description: |
+  This is an example challenge configuration in YAML format.
+
+  **Objective:** Decrypt the message to find the hidden flag.
+
+  **Difficulty:** Medium
+
+  **Author:** CTF Team
+
+  **Note:** This challenge requires knowledge of classical ciphers.
+
+category: "crypto"
+type: "standard"
+value: 300
+state: "visible"
+
+flags:
+  - content: "flag{yaml_configuration_example}"
+    type: "static"
+  - content: "flag{caesar_cipher_solved}"
+    type: "static"
+
+hints:
+  - content: "This is a substitution cipher"
+    cost: 15
+  - content: "Try frequency analysis on the ciphertext"
+    cost: 30
+  - content: "The key might be a simple shift"
+    cost: 50
+
+files:
+  - "encrypted_message.txt"
+  - "cipher_tool.py"
+  - "frequency_analysis.txt"

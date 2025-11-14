@@ -1,0 +1,33 @@
+{
+  "name": "Web Exploitation Example",
+  "description": "This is an example challenge configuration in JSON format.\n\n**Objective:** Find and exploit the vulnerability to get the flag.\n\n**URL:** http://challenge.example.com:3000\n\n**Author:** CTF Team",
+  "category": "web",
+  "type": "standard",
+  "value": 200,
+  "state": "visible",
+  "flags": [
+    {
+      "content": "flag{json_configuration_example}",
+      "type": "static"
+    },
+    {
+      "content": "flag{alternative_solution_path}",
+      "type": "static"
+    }
+  ],
+  "hints": [
+    {
+      "content": "Check the source code for hidden comments",
+      "cost": 10
+    },
+    {
+      "content": "Look at the HTTP headers in the response",
+      "cost": 20
+    },
+    {
+      "content": "Try different HTTP methods on the endpoints",
+      "cost": 30
+    }
+  ],
+  "files": ["challenge_files.zip", "source_code.tar.gz", "README.txt"]
+}
