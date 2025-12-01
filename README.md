@@ -1,4 +1,4 @@
-# BABY-PUSH-ALL-MYTASKS
+# Baby Push all my tasks
 
 A Python script for deploying CTF tasks to CTFd instances with credential management and robust error handling.
 
