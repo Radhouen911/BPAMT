@@ -12,7 +12,7 @@ import requests
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 import yaml
 import zipfile
 import tempfile
@@ -27,6 +27,55 @@ class CTFdDeployer:
         self.failed_tasks = []
         self.file_errors = []
         self.existing_challenges = []
+
+    def normalize_files_field(self, files_field: Any) -> List[str]:
+        """Normalize challenge files field to a list of file paths."""
+        if files_field is None:
+            return []
+
+        if isinstance(files_field, str):
+            normalized = files_field.strip()
+            return [normalized] if normalized else []
+
+        if isinstance(files_field, list):
+            normalized_files = []
+            for item in files_field:
+                if isinstance(item, str):
+                    item = item.strip()
+                    if item:
+                        normalized_files.append(item)
+                else:
+                    print(f"  ⚠️ Skipping invalid file entry (not a string): {item}")
+            return normalized_files
+
+        print(f"  ⚠️ Invalid 'files' format: expected string or list, got {type(files_field).__name__}")
+        return []
+
+    def verify_challenge_files(self, challenge_id: int, expected_locations: List[str]) -> bool:
+        """Verify uploaded files are attached to the challenge."""
+        try:
+            response = self.session.get(f"{self.base_url}/api/v1/challenges/{challenge_id}/files")
+            if response.status_code != 200:
+                print(f"  ✗ Could not verify challenge files for ID {challenge_id}: {response.text}")
+                return False
+
+            data = response.json().get('data', [])
+            attached_locations = {
+                item.get('location')
+                for item in data
+                if isinstance(item, dict) and item.get('location')
+            }
+
+            missing = [loc for loc in expected_locations if loc not in attached_locations]
+            if missing:
+                print(f"  ✗ File verification failed for challenge ID {challenge_id}. Missing links: {missing}")
+                return False
+
+            print(f"  ✓ Verified {len(expected_locations)} file(s) attached to challenge ID {challenge_id}")
+            return True
+        except Exception as e:
+            print(f"  ✗ Error verifying files for challenge ID {challenge_id}: {e}")
+            return False
         
     def load_credentials(self) -> bool:
         """Load stored credentials if they exist"""
@@ -253,15 +302,87 @@ class CTFdDeployer:
             print(f"✗ Error loading {task_file}: {e}")
             return None    
 
-    def create_challenge(self, task_data: Dict, task_dir: Path, force_duplicates: bool = False, debug_duplicates: bool = False) -> bool:
+    def create_challenge(self, task_data: Dict, task_dir: Path, force_duplicates: bool = False, debug_duplicates: bool = False, update_existing_files: bool = False, challenge_id_override: Optional[int] = None) -> bool:
         """Create a challenge in CTFd."""
         challenge_name = task_data.get('name', 'Unnamed Challenge')
         category = task_data.get('category', 'misc')
+
+        # If a challenge ID override is provided, upload files directly to that existing challenge
+        if challenge_id_override is not None:
+            files_to_upload = self.normalize_files_field(task_data.get('files'))
+            if not files_to_upload:
+                print(f"⚠️ No files found in task '{challenge_name}' to upload to challenge ID {challenge_id_override}")
+                return True
+
+            print(f"🔄 Uploading files from '{challenge_name}' to existing challenge ID {challenge_id_override}")
+            success = self.upload_files(challenge_id_override, files_to_upload, task_dir, challenge_name)
+            if success:
+                if category not in self.deployed_tasks:
+                    self.deployed_tasks[category] = []
+                self.deployed_tasks[category].append({
+                    'name': challenge_name,
+                    'id': challenge_id_override,
+                    'value': task_data.get('value', 0),
+                    'type': task_data.get('type', 'standard'),
+                    'state': task_data.get('state', 'visible'),
+                    'status': 'updated_specific_challenge'
+                })
+                return True
+
+            self.failed_tasks.append({
+                'name': challenge_name,
+                'category': category,
+                'error': f"Failed to upload files to challenge ID {challenge_id_override}",
+                'stage': 'challenge_id_override_upload'
+            })
+            return False
         
         # Check for duplicates (unless forced to skip)
         if not force_duplicates:
             existing_challenge = self.find_duplicate_challenge(task_data, debug_duplicates)
             if existing_challenge:
+                if update_existing_files:
+                    existing_id = existing_challenge['id']
+                    files_to_upload = self.normalize_files_field(task_data.get('files'))
+
+                    if not files_to_upload:
+                        print(f"   ⚠️ Duplicate found for '{challenge_name}', but no local files to upload")
+                        if category not in self.deployed_tasks:
+                            self.deployed_tasks[category] = []
+                        self.deployed_tasks[category].append({
+                            'name': challenge_name,
+                            'id': existing_id,
+                            'value': existing_challenge.get('value', 0),
+                            'type': existing_challenge.get('type', 'standard'),
+                            'state': existing_challenge.get('state', 'visible'),
+                            'status': 'updated_existing_files_noop'
+                        })
+                        return True
+
+                    print(f"   🔄 Duplicate found. Uploading files to existing challenge ID {existing_id}...")
+                    upload_success = self.upload_files(existing_id, files_to_upload, task_dir, challenge_name)
+                    if not upload_success:
+                        error_msg = f"Failed to upload files to existing challenge ID {existing_id}"
+                        self.failed_tasks.append({
+                            'name': challenge_name,
+                            'category': category,
+                            'error': error_msg,
+                            'stage': 'existing_files_update'
+                        })
+                        return False
+
+                    if category not in self.deployed_tasks:
+                        self.deployed_tasks[category] = []
+                    self.deployed_tasks[category].append({
+                        'name': challenge_name,
+                        'id': existing_id,
+                        'value': existing_challenge.get('value', 0),
+                        'type': existing_challenge.get('type', 'standard'),
+                        'state': existing_challenge.get('state', 'visible'),
+                        'status': 'updated_existing_files'
+                    })
+                    return True
+
                 action = self.handle_duplicate_challenge(task_data, existing_challenge)
                 if action == 'skip':
                     # Track as skipped, not failed
@@ -295,6 +416,32 @@ class CTFdDeployer:
                     'initial': extra.get('initial', challenge_data['value']),
                     'decay': extra.get('decay', 20),
                     'minimum': extra.get('minimum', 100)
+                })
+
+            # Swarm challenges use the plugin's top-level fields rather than
+            # the standard CTFd dynamic challenge "extra" object.
+            if challenge_data['type'] == 'swarm':
+                required_swarm_fields = ('docker_image', 'container_port')
+                missing_swarm_fields = [
+                    field for field in required_swarm_fields
+                    if field not in task_data
+                ]
+                if missing_swarm_fields:
+                    raise ValueError(
+                        "Swarm challenge is missing required fields: "
+                        + ", ".join(missing_swarm_fields)
+                    )
+
+                challenge_data.update({
+                    'initial': task_data.get('initial', challenge_data['value']),
+                    'function': task_data.get('function', 'logarithmic'),
+                    'decay': task_data.get('decay', 20),
+                    'minimum': task_data.get('minimum', 100),
+                    'docker_image': task_data['docker_image'],
+                    'container_port': task_data['container_port'],
+                    'ttl_seconds': task_data.get('ttl_seconds', 3600),
+                    'cpu_limit': task_data.get('cpu_limit', 0.5),
+                    'mem_limit_mb': task_data.get('mem_limit_mb', 256)
                 })
             
             # Create the challenge
@@ -340,8 +487,9 @@ class CTFdDeployer:
                     task_info['hints_error'] = True
             
             # Upload files
-            if 'files' in task_data:
-                if not self.upload_files(challenge_id, task_data['files'], task_dir, challenge_name):
+            files_to_upload = self.normalize_files_field(task_data.get('files'))
+            if files_to_upload:
+                if not self.upload_files(challenge_id, files_to_upload, task_dir, challenge_name):
                     task_info['files_error'] = True
             
             self.deployed_tasks[category].append(task_info)
@@ -449,9 +597,11 @@ class CTFdDeployer:
             else:
                 print("  Invalid choice. Please enter 's' for skip, 'p' for path, or 'q' to quit")
 
-    def upload_files(self, challenge_id: int, files: List, task_dir: Path, challenge_name: str = "Unknown") -> bool:
+    def upload_files(self, challenge_id: int, files: List[str], task_dir: Path, challenge_name: str = "Unknown") -> bool:
         """Upload challenge files"""
         try:
+            uploaded_locations = []
+
             for file_path in files:
                 full_path = task_dir / file_path
                 if not full_path.exists():
@@ -462,30 +612,48 @@ class CTFdDeployer:
                 
                 with open(full_path, 'rb') as f:
                     files_data = {'file': (full_path.name, f, 'application/octet-stream')}
-                    
-                    headers = self.session.headers.copy()
-                    if 'Content-Type' in self.session.headers:
-                        del self.session.headers['Content-Type']
+                    multipart_headers = {
+                        key: value
+                        for key, value in self.session.headers.items()
+                        if key.lower() != 'content-type'
+                    }
                     
                     response = self.session.post(
                         f"{self.base_url}/api/v1/files",
                         files=files_data,
-                        data={'challenge_id': challenge_id}
+                        data={
+                            'challenge': challenge_id,
+                            'challenge_id': challenge_id,
+                            'type': 'challenge'
+                        },
+                        headers=multipart_headers
                     )
-                    
-                    self.session.headers.update(headers)
                 
                 if response.status_code == 200:
                     print(f"  ✓ Uploaded file: {file_path}")
+
+                    response_data = response.json().get('data', [])
+                    if isinstance(response_data, dict):
+                        response_data = [response_data]
+
+                    for uploaded in response_data:
+                        location = uploaded.get('location') if isinstance(uploaded, dict) else None
+                        if location:
+                            uploaded_locations.append(location)
                 else:
                     print(f"  ✗ Failed to upload {file_path}: {response.text}")
                     return False
+
+            if uploaded_locations:
+                if not self.verify_challenge_files(challenge_id, uploaded_locations):
+                    return False
+
             return True
         except Exception as e:
             print(f"✗ Error uploading files: {e}")
             return False 
    
-    def deploy_tasks(self, directory: Path, force_duplicates: bool = False, debug_duplicates: bool = False) -> bool:
+    def deploy_tasks(self, directory: Path, force_duplicates: bool = False, debug_duplicates: bool = False, update_existing_files: bool = False, challenge_id_override: Optional[int] = None) -> bool:
         """Deploy all tasks from directory."""
         # Resolve the path to handle relative paths properly
         directory = directory.resolve()
@@ -512,7 +680,7 @@ class CTFdDeployer:
                 continue
             
             task_dir = task_file.parent
-            if self.create_challenge(task_data, task_dir, force_duplicates, debug_duplicates):
+            if self.create_challenge(task_data, task_dir, force_duplicates, debug_duplicates, update_existing_files, challenge_id_override):
                 success_count += 1
         
         print(f"\n{'='*50}")
@@ -538,6 +706,12 @@ class CTFdDeployer:
                     status_icons = []
                     if task.get('status') == 'skipped_duplicate':
                         status_icons.append("⏭️ skipped duplicate")
+                    if task.get('status') == 'updated_existing_files':
+                        status_icons.append("🔄 updated existing files")
+                    if task.get('status') == 'updated_existing_files_noop':
+                        status_icons.append("ℹ️ no files to update")
+                    if task.get('status') == 'updated_specific_challenge':
+                        status_icons.append("🎯 uploaded to specific challenge")
                     if task.get('flags_error'):
                         status_icons.append("⚠️ flags")
                     if task.get('hints_error'):
@@ -643,6 +817,34 @@ class CTFdDeployer:
                     state_icon = "👁️" if chall.get('state') == 'visible' else "🔒"
                     type_info = f"[{chall.get('type', 'standard')}]" if chall.get('type') != 'standard' else ""
                     print(f"  {state_icon} {chall['name']} (ID: {chall['id']}, {chall.get('value', 0)} pts) {type_info}")
+                    if chall.get('type') == 'swarm':
+                        detail = chall
+                        try:
+                            detail_response = self.session.get(
+                                f"{self.base_url}/api/v1/challenges/{chall['id']}"
+                            )
+                            if detail_response.status_code == 200:
+                                detail = detail_response.json().get('data', chall)
+                        except (requests.RequestException, ValueError):
+                            detail = chall
+
+                        swarm_fields = {
+                            field: detail.get(field)
+                            for field in (
+                                'initial',
+                                'function',
+                                'decay',
+                                'minimum',
+                                'docker_image',
+                                'container_port',
+                                'ttl_seconds',
+                                'cpu_limit',
+                                'mem_limit_mb'
+                            )
+                            if field in detail
+                        }
+                        if swarm_fields:
+                            print(f"    Swarm settings: {swarm_fields}")
             
             print(f"\n{'='*60}")
             print(f"Total: {total_challenges} challenges across {len(by_category)} categories")
@@ -909,7 +1111,9 @@ Examples:
   %(prog)s --preview ./challenges       # Preview local vs deployed tasks
   %(prog)s --list-deployed              # List current challenges on CTFd
   %(prog)s --dry-run ./challenges       # Show what would be deployed
-  %(prog)s --force-duplicates ./tasks   # Skip duplicate detection
+    %(prog)s --force-duplicates ./tasks   # Skip duplicate detection
+    %(prog)s --update-existing-files ./tasks  # Upload files to existing challenge with same name
+    %(prog)s --challenge-id 33 ./tasks    # Upload files directly to challenge ID 33
         """
     )
     parser.add_argument('directory', nargs='?', default='.', 
@@ -924,6 +1128,10 @@ Examples:
                        help='Show what would be deployed without actually doing it')
     parser.add_argument('--force-duplicates', action='store_true', 
                        help='Skip duplicate detection and add all challenges')
+    parser.add_argument('--update-existing-files', action='store_true',
+                       help='If duplicate challenge exists, upload files to existing challenge instead of creating a new one')
+    parser.add_argument('--challenge-id', type=int,
+                       help='Upload files to this existing challenge ID instead of creating/updating by name')
     parser.add_argument('--debug-duplicates', action='store_true', 
                        help='Show detailed duplicate detection debug info')
     parser.add_argument('--offline-preview', action='store_true',
@@ -1017,7 +1225,7 @@ Examples:
                 if task_data:
                     print(f"Would deploy: {task_data.get('name', 'Unnamed')} from {task_file.parent.name}/")
         else:
-            success = deployer.deploy_tasks(directory, args.force_duplicates, args.debug_duplicates)
+            success = deployer.deploy_tasks(directory, args.force_duplicates, args.debug_duplicates, args.update_existing_files, args.challenge_id)
             sys.exit(0 if success else 1)
             
     except KeyboardInterrupt:
